@@ -528,6 +528,7 @@
     if (obj.isSoldOut === true) obj.isSoldOut = false;
     if (obj.soldOut === true) obj.soldOut = false;
     if (obj.isServerBusy === true) obj.isServerBusy = false;
+    if (obj.isLimitBuy === true) obj.isLimitBuy = false;
     if (obj.disabled === true && (obj.price !== undefined || obj.productId || obj.title)) obj.disabled = false;
     if (obj.stock === 0) obj.stock = 999;
     for (const k of Object.keys(obj)) {
@@ -727,21 +728,33 @@
         const data = respObj?.data;
         const soldOut = data?.soldOut || data?.isSoldOut;
 
+        // 持久化非成功响应到 localStorage，供事后分析（最多保留24小时）
+        if (code !== 200 || !data?.bizId) {
+          try {
+            const key = 'glm_bypass_preview_log';
+            const arr = JSON.parse(localStorage.getItem(key) || '[]');
+            const dayAgo = Date.now() - 86400000;
+            const fresh = arr.filter(e => new Date(e.ts).getTime() > dayAgo);
+            fresh.push({ ts: new Date().toISOString(), code, body: text.slice(0, 800) });
+            localStorage.setItem(key, JSON.stringify(fresh));
+          } catch (e) {}
+        }
+
         if (code === 200 && data?.bizId) {
           _lastPreviewResult = 'ok';
         } else if (code === 555) {
           _lastPreviewResult = '555';
-          log('[Preview-fetch] 555系统繁忙，拦截响应，立即重试', 'warn');
+          log(`[Preview-fetch] 555响应体: ${text.slice(0, 500)}`, 'warn');
           triggerPreviewRetry('555系统繁忙');
           return new Response('{"code":555,"msg":"系统繁忙","data":null,"success":false}', { status: 200, headers: { 'Content-Type': 'application/json' } });
         } else if (soldOut || (code === 200 && !data?.bizId)) {
           _lastPreviewResult = 'soldOut';
-          log('[Preview-fetch] 响应售罄/无bizId，拦截响应，立即重试', 'warn');
+          log(`[Preview-fetch] 售罄响应体: ${text.slice(0, 500)}`, 'warn');
           triggerPreviewRetry('售罄');
           return new Response('{"code":555,"msg":"系统繁忙","data":null,"success":false}', { status: 200, headers: { 'Content-Type': 'application/json' } });
         } else if (code === 500 || code === 405) {
           _lastPreviewResult = 'error';
-          log(`[Preview-fetch] code=${code}，拦截响应，立即重试`, 'warn');
+          log(`[Preview-fetch] ${code}响应体: ${text.slice(0, 500)}`, 'warn');
           triggerPreviewRetry(`code=${code}`);
           return new Response('{"code":555,"msg":"系统繁忙","data":null,"success":false}', { status: 200, headers: { 'Content-Type': 'application/json' } });
         }
@@ -896,6 +909,7 @@
           const modified = text
             .replace(/"isSoldOut"\s*:\s*true/g, '"isSoldOut":false')
             .replace(/"soldOut"\s*:\s*true/g, '"soldOut":false')
+            .replace(/"isLimitBuy"\s*:\s*true/g, '"isLimitBuy":false')
             .replace(/"stock"\s*:\s*0/g, '"stock":999')
             .replace(/"disabled"\s*:\s*true/g, '"disabled":false');
           if (modified !== text) {
@@ -1170,6 +1184,10 @@
         }
         if ('isSoldOut' in vm.$data || vm.isSoldOut === true) {
           makePermanentlyFalse(vm, 'isSoldOut');
+          patched++;
+        }
+        if ('isLimitBuy' in vm.$data || vm.isLimitBuy === true) {
+          makePermanentlyFalse(vm, 'isLimitBuy');
           patched++;
         }
       }
@@ -2694,7 +2712,8 @@
       // ── 2. 提取背景图 URL ──
       const bgUrl = mainPageFindBgUrl();
       if (!bgUrl) {
-        log('[主页面验证码] 背景图 URL 为空');
+        // 刷新动画期间 URL 被清空，Observer 提前触发导致空跑。
+        // 不放弃，等图片加载完成后 Observer/定时器会自然再次触发。
         _captchaState = CAPTCHA_STATE.IDLE;
         _captchaProcessing = false;
         return;
@@ -2915,15 +2934,11 @@
       log('[验证码] 已刷新');
     }
     _captchaLastBgUrl = '';
-    _captchaLastChars = '';
-    _captchaSkipCount = 0;
+    // 不清空 _captchaLastChars 和 _captchaSkipCount：
+    // 超时刷新后若服务端返回同一张图，sameChars 检测能立即识别并累加 skipCount，
+    // 满三次关闭弹窗重启，避免同一张验证码反复提交的死循环。
+    // 只有真正不同的验证码出现时（chars 不同），2756 行才会重置这些值。
     _captchaState = CAPTCHA_STATE.IDLE;
-    // 注意：不清除 _captchaProcessing！让整个链路结束后自然解锁
-    // 新的验证码图片出现时，Observer/定时器触发的 mainPageSolveCaptcha
-    // 会因为 _captchaProcessing=true 而被阻止
-    // 等新图片加载完成后，500ms 延迟的 setTimeout 会再次被触发
-    // 但我们需要在 refresh 后解锁以允许新识别
-    // 解决方案：延迟解锁，给 refresh 加载新图片的时间
     setTimeout(() => { if (_rushStopped) return; _captchaProcessing = false; }, 800);
   }
 
