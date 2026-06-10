@@ -416,11 +416,11 @@
     checkTimeout: 5000,    // check校验超时，高峰期放宽
     captchaServer: 'http://127.0.0.1:8888',
     autoCaptchaConfirm: true,
-    preSolveMs: 2500, // 提前多少毫秒触发验证码预求解（OCR+验证在10:00前完成，preview刚好落在T+0）
-    retryIntervalMs: 300,     // 重试间隔(ms)，并发+快速间隔=高吞吐
-    retryMaxConcurrent: 5,    // 最大并发请求数，同时发5个请求抢窗口
+    preSolveMs: 2500, // 提前2.5秒触发，刚好让验证码在10:00前解完
+    retryIntervalMs: 500,     // 重试间隔(ms)，避免触发限频
+    retryMaxConcurrent: 3,    // 最大并发，3个避免封IP
     retryTicketTTL: 170000,   // ticket有效期(ms)，3分钟-10s安全余量
-    retryTimeout: 3000,       // 并行重试引擎：单请求超时(ms)，高峰期3秒足够
+    retryTimeout: 4000,       // 单请求超时(ms)
   };
 
   try {
