@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         glm_bypass
 // @namespace    https://github.com/langbyyi/GLM_bypass
-// @version      1.0.0
+// @version      1.1.0
 // @description  极致抢购助手 - 并发重试+验证码自动识别+直接锁单+时钟校准+反检测+Vue Hacking+多标签协同+登录兼容
 // @author       glm_bypass
 // @updateURL    https://raw.githubusercontent.com/langbyyi/GLM_bypass/master/glm_bypass.user.js
@@ -417,9 +417,10 @@
     captchaServer: 'http://127.0.0.1:8888',
     autoCaptchaConfirm: true,
     preSolveMs: 2500, // 提前多少毫秒触发验证码预求解（OCR+验证在10:00前完成，preview刚好落在T+0）
-    retryIntervalMs: 800,     // 均匀重试：单次请求间隔(ms)，约1.25 req/s
+    retryIntervalMs: 300,     // 重试间隔(ms)，并发+快速间隔=高吞吐
+    retryMaxConcurrent: 5,    // 最大并发请求数，同时发5个请求抢窗口
     retryTicketTTL: 170000,   // ticket有效期(ms)，3分钟-10s安全余量
-    retryTimeout: 5000,       // 并行重试引擎：单请求超时(ms)，正常preview响应<500ms，5秒足够
+    retryTimeout: 3000,       // 并行重试引擎：单请求超时(ms)，高峰期3秒足够
   };
 
   try {
@@ -681,11 +682,14 @@
         }
       } catch (e) {}
 
-      setState({ captured });
-      try { sessionStorage.setItem('glm_bypass_captured_req', JSON.stringify(captured)); } catch (e) {}
+      // 只用带ticket的请求更新state.captured，防止无ticket请求污染重试引擎
+      if (captured.body && captured.body.includes('"ticket"')) {
+        setState({ captured });
+        try { sessionStorage.setItem('glm_bypass_captured_req', JSON.stringify(captured)); } catch (e) {}
+      }
 
-      // 并行重试引擎：将新ticket加入池
-      if (_retryEngineActive && captured.body && !captured.body.includes('trerror')) {
+      // 并行重试引擎：只把带ticket的请求加入池
+      if (_retryEngineActive && captured.body && captured.body.includes('"ticket"') && !captured.body.includes('trerror')) {
         retryEngineAddTicket(captured);
       }
 
@@ -990,8 +994,15 @@
         triggerPreviewRetry('超时');
       }, CFG.previewTimeout);
 
-      // 并行重试引擎：将XHR捕获的ticket加入池
-      if (_retryEngineActive && body && !body.includes('trerror')) {
+      // 只用带ticket的请求更新state.captured，防止无ticket请求污染重试引擎
+      // XHR路径也必须更新，否则triggerPreviewRetry条件不满足，重试引擎永远启动不了
+      if (body && body.includes('"ticket"')) {
+        setState({ captured: { url, method: self._m || 'POST', body, headers: self._h || {} } });
+        try { sessionStorage.setItem('glm_bypass_captured_req', JSON.stringify(state.captured)); } catch (e) {}
+      }
+
+      // 并行重试引擎：只把带ticket的请求加入池
+      if (_retryEngineActive && body && body.includes('"ticket"') && !body.includes('trerror')) {
         retryEngineAddTicket({ body, headers: this._h || {} });
       }
 
@@ -1013,6 +1024,18 @@
             const code = respObj?.code;
             const data = respObj?.data;
             const soldOut = data?.soldOut || data?.isSoldOut;
+
+            // 持久化非成功响应到 localStorage，供事后分析（最多保留24小时）
+            if (code !== 200 || !data?.bizId) {
+              try {
+                const key = 'glm_bypass_preview_log';
+                const arr = JSON.parse(localStorage.getItem(key) || '[]');
+                const dayAgo = Date.now() - 86400000;
+                const fresh = arr.filter(e => new Date(e.ts).getTime() > dayAgo);
+                fresh.push({ ts: new Date().toISOString(), code, body: text.slice(0, 800) });
+                localStorage.setItem(key, JSON.stringify(fresh));
+              } catch (e) {}
+            }
 
             if (code === 200 && data?.bizId) {
               // 真正成功：有bizId，让Vue正常渲染支付弹窗
@@ -2341,6 +2364,7 @@
       return;
     }
     if (!initialCaptured?.body) { log('[重试引擎] 无请求体，跳过', 'warn'); return; }
+    if (!initialCaptured.body.includes('"ticket"')) { log('[重试引擎] 请求体无ticket，跳过', 'warn'); return; }
     if (initialCaptured.body.includes('trerror')) { log('[重试引擎] trerror ticket，跳过', 'warn'); return; }
 
     _retryEngineActive = true;
@@ -2355,12 +2379,15 @@
       capturedAt: Date.now()
     }];
 
-    log(`[重试引擎] 启动 epoch=${_retryEngineEpoch} 间隔=${CFG.retryIntervalMs}ms`);
+    log(`[重试引擎] 启动 epoch=${_retryEngineEpoch} 间隔=${CFG.retryIntervalMs}ms 并发=${CFG.retryMaxConcurrent || 5}`);
 
-    // 立即发射第一个请求
-    retryEngineFireOne();
+    // 立即发射多个并发请求
+    const maxC = CFG.retryMaxConcurrent || 5;
+    for (let i = 0; i < maxC; i++) {
+      retryEngineFireOne();
+    }
 
-    // 定时均匀发射
+    // 定时均匀发射（保持并发满载）
     _retryEngineBatchTimer = setInterval(retryEngineFireOne, CFG.retryIntervalMs);
   }
 
@@ -2384,6 +2411,7 @@
   function retryEngineAddTicket(captured) {
     if (!_retryEngineActive) return;
     if (!captured?.body) return;
+    if (!captured.body.includes('"ticket"')) return;
     if (captured.body.includes('trerror')) { log('[重试引擎] 跳过trerror ticket'); return; }
     // 去重
     if (_retryEngineTickets.some(t => t.body === captured.body)) return;
@@ -2406,16 +2434,17 @@
     _retryEngineTickets = _retryEngineTickets.filter(t => (now - t.capturedAt) < CFG.retryTicketTTL);
     if (_retryEngineTickets.length === 0) return;
 
-    // 最多1个在途，保证均匀
-    if (_retryEngineInflight >= 1) return;
+    // 并发请求，最大化吞吐
+    if (_retryEngineInflight >= (CFG.retryMaxConcurrent || 5)) return;
 
-    // Round-robin选ticket
-    const ticket = _retryEngineTickets[_retryEngineTotalAttempts % _retryEngineTickets.length];
+    // Round-robin选ticket，用随机分散避免所有并发打到同一个ticket
+    const idx = _retryEngineTotalAttempts % _retryEngineTickets.length;
+    const ticket = _retryEngineTickets[idx];
     retryEngineFireSingle(ticket);
 
     // 每10次打印日志
     if (_retryEngineTotalAttempts % 10 === 0) {
-      log(`[重试引擎] 总计=${_retryEngineTotalAttempts}, 池=${_retryEngineTickets.length}`);
+      log(`[重试引擎] 总计=${_retryEngineTotalAttempts}, 池=${_retryEngineTickets.length}, 在途=${_retryEngineInflight}`);
     }
   }
 
@@ -2462,7 +2491,19 @@
         retryEngineHandleSuccess(text, respObj);
         return; // retryEngineStop已重置inflight，不重复递减
       }
-      // 555/500/其他：ticket留在池中继续用
+
+      // ticket已被消费才移除池。"验证码校验服务异常"是服务端过载，ticket仍然有效！
+      const msg = respObj?.msg || '';
+      const ticketConsumed = msg.includes('已被使用') || msg.includes('安全风险') ||
+        (msg.includes('校验异常') && !msg.includes('服务异常'));
+      if (code === 500 && ticketConsumed) {
+        const idx = _retryEngineTickets.indexOf(ticket);
+        if (idx !== -1) {
+          _retryEngineTickets.splice(idx, 1);
+          log(`[重试引擎] ticket已失效(${msg.slice(0, 15)})，移出池，剩余=${_retryEngineTickets.length}`);
+        }
+      }
+      // 555系统繁忙：ticket尚未被消费，留在池中继续用
     } catch (e) {
       // 网络/解析错误，忽略
     }
@@ -3058,7 +3099,7 @@
   // ── 3K-8a. Preview API失败 → 立即重试购买 ──
   function triggerPreviewRetry(reason) {
     // ═══ 并行重试引擎：复用当前ticket高频重发 ═══
-    if (!_paymentFrozen && _rushActive && state.captured?.body && !state.captured.body.includes('trerror')) {
+    if (!_paymentFrozen && _rushActive && state.captured?.body && state.captured.body.includes('"ticket"') && !state.captured.body.includes('trerror')) {
       if (!_retryEngineActive) {
         retryEngineStart(state.captured);
       } else {
@@ -3091,8 +3132,8 @@
 
       // 重置验证码状态，允许重新触发验证码识别
       _captchaState = CAPTCHA_STATE.IDLE;
-      // 不清空 _captchaLastBgUrl 和 _captchaLastChars！防止重新识别同一张验证码图
-      _captchaSkipCount = 0;
+      // 不清空 _captchaLastBgUrl、_captchaLastChars 和 _captchaSkipCount！
+      // 防止关闭弹窗后服务端返回同一张图被当作新验证码提交。
       _captchaAttempt = 0; // preview失败不是OCR的问题，重置计数
       _captchaQrRetried = false;
       _qrRetryEpoch++;
@@ -3107,12 +3148,12 @@
         log(`[Preview重试] 原因:${reason}，未找到购买按钮`, 'warn');
       }
       // 点击购买后延迟解锁，给验证码加载时间
-      // 冷却期：1200ms 内不允许新的 preview 重试
+      // 冷却期：500ms 内不允许新的 preview 重试
       setTimeout(() => {
         if (!_rushStopped) _captchaProcessing = false;
         _previewRetryTimer = null; // 冷却结束，允许下一次重试
-      }, 1200);
-    }, 100); // 100ms防抖
+      }, 500);
+    }, 30); // 30ms防抖，快速重试
   }
   function closeEmptyPayDialog() {
     if (_rushStopped) { _captchaState = CAPTCHA_STATE.IDLE; _captchaProcessing = false; return; }
